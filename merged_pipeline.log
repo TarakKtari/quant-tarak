@@ -1,0 +1,49 @@
+[22:40:51] [INFO] ================================================================================
+[22:40:51] [INFO] VALIDATION START | asset=EURUSD=X timeframe=1h | pandas=3.0.0 numpy=2.3.5
+[22:40:51] [INFO] SAFE decompose_every=50 rolling_window=600 hilbert_window=256
+[22:40:51] [INFO] Fetching EURUSD=X (1h -> 1h) from 2025-06-01...
+[22:40:52] [WARNING] Missing weekday bars: 87 (2.0%)
+[22:40:52] [INFO] Data ready: 4253 bars.
+[22:40:52] [INFO] Decomposing SAFE MODE (every 50 bars)...
+[22:40:52] [INFO] SafeMode progress: 200/4253
+[22:40:52] [INFO] SafeMode progress: 400/4253
+[22:40:52] [INFO] SafeMode progress: 600/4253
+[22:40:52] [INFO] SafeMode progress: 800/4253
+[22:40:52] [INFO] SafeMode progress: 1000/4253
+[22:40:52] [INFO] SafeMode progress: 1200/4253
+[22:40:52] [INFO] SafeMode progress: 1400/4253
+[22:40:52] [INFO] SafeMode progress: 1600/4253
+[22:40:52] [INFO] SafeMode progress: 1800/4253
+[22:40:52] [INFO] SafeMode progress: 2000/4253
+[22:40:52] [INFO] SafeMode progress: 2200/4253
+[22:40:52] [INFO] SafeMode progress: 2400/4253
+[22:40:53] [INFO] SafeMode progress: 2600/4253
+[22:40:53] [INFO] SafeMode progress: 2800/4253
+[22:40:53] [INFO] SafeMode progress: 3000/4253
+[22:40:53] [INFO] SafeMode progress: 3200/4253
+[22:40:53] [INFO] SafeMode progress: 3400/4253
+[22:40:53] [INFO] SafeMode progress: 3600/4253
+[22:40:53] [INFO] SafeMode progress: 3800/4253
+[22:40:53] [INFO] SafeMode progress: 4000/4253
+[22:40:53] [INFO] SafeMode progress: 4200/4253
+[22:40:53] [INFO] Safe mode done in 0.9s
+[22:40:54] [INFO] WF fold 0 | train[2025-06-17->2025-08-26] test[2025-08-26->2025-09-05] | best={l2=0.5, enter_edge=0.05, exit_edge=0.02, min_conf=0.5}
+[22:40:54] [INFO] WF fold 0 TRAIN | bars=1200 equity=-0.021219 Sharpe=-1.90 Sortino=-1.18 MaxDD=0.029291 trades=34 hit=35.3% PF=0.59 avg_trade=-0.00062409 avg_hold=11.6 turnover_events=68
+[22:40:54] [INFO] WF fold 0 TEST  | bars=200 equity=0.007393 Sharpe=4.66 Sortino=2.94 MaxDD=0.004338 trades=1 hit=100.0% PF=inf avg_trade=0.00739302 avg_hold=39.0 turnover_events=2
+[22:40:56] [INFO] WF fold 1 | train[2025-07-22->2025-09-30] test[2025-09-30->2025-10-13] | best={l2=2.0, enter_edge=0.1, exit_edge=0.02, min_conf=0.5}
+[22:40:56] [INFO] WF fold 1 TRAIN | bars=1200 equity=-0.000263 Sharpe=-0.05 Sortino=-0.02 MaxDD=0.016290 trades=9 hit=55.6% PF=0.98 avg_trade=-2.92692e-05 avg_hold=18.8 turnover_events=18
+[22:40:56] [INFO] WF fold 1 TEST  | bars=200 equity=0.004936 Sharpe=5.17 Sortino=3.54 MaxDD=0.003077 trades=2 hit=100.0% PF=inf avg_trade=0.00246801 avg_hold=21.5 turnover_events=4
+[22:40:57] [INFO] WF fold 2 | train[2025-08-26->2025-11-05] test[2025-11-05->2025-11-17] | best={l2=5.0, enter_edge=0.05, exit_edge=0.02, min_conf=0.5}
+[22:40:57] [INFO] WF fold 2 TRAIN | bars=1200 equity=0.033493 Sharpe=4.47 Sortino=3.97 MaxDD=0.009253 trades=13 hit=69.2% PF=4.26 avg_trade=0.00205936 avg_hold=25.0 turnover_events=27
+[22:40:57] [INFO] WF fold 2 TEST  | bars=200 equity=-0.003492 Sharpe=-7.76 Sortino=-5.46 MaxDD=0.004679 trades=1 hit=0.0% PF=0.00 avg_trade=-0.00349217 avg_hold=32.0 turnover_events=2
+[22:40:58] [INFO] WF fold 3 | train[2025-09-30->2025-12-10] test[2025-12-10->2025-12-22] | best={l2=0.5, enter_edge=0.15, exit_edge=0.01, min_conf=0.5}
+[22:40:58] [INFO] WF fold 3 TRAIN | bars=1200 equity=0.017205 Sharpe=3.99 Sortino=2.56 MaxDD=0.003367 trades=4 hit=75.0% PF=35.32 avg_trade=0.00430136 avg_hold=40.2 turnover_events=8
+[22:40:58] [INFO] WF fold 3 TEST  | bars=200 equity=0.000000 Sharpe=0.00 Sortino=0.00 MaxDD=0.000000 trades=0 hit=0.0% PF=0.00 avg_trade=0 avg_hold=0.0 turnover_events=0
+[22:40:59] [WARNING] WF fold 4: no candidate met min_trades; using fallback {'signal_model': 'bayes-logit', 'bayes_l2': 0.5, 'prob_enter_edge': 0.05, 'prob_exit_edge': 0.01, 'prob_min_direction_conf': 0.6}.
+[22:40:59] [INFO] WF fold 4 | train[2025-11-05->2026-01-15] test[2026-01-15->2026-01-28] | best={l2=0.5, enter_edge=0.05, exit_edge=0.01, min_conf=0.6}
+[22:40:59] [INFO] WF fold 4 TRAIN | bars=1200 equity=0.000000 Sharpe=0.00 Sortino=0.00 MaxDD=0.000000 trades=0 hit=0.0% PF=0.00 avg_trade=0 avg_hold=0.0 turnover_events=0
+[22:40:59] [INFO] WF fold 4 TEST  | bars=200 equity=0.000000 Sharpe=0.00 Sortino=0.00 MaxDD=0.000000 trades=0 hit=0.0% PF=0.00 avg_trade=0 avg_hold=0.0 turnover_events=0
+[22:40:59] [INFO] WALK-FORWARD OOS | bars=1000 equity=0.008837 Sharpe=2.08 Sortino=1.03 MaxDD=0.005146 trades=4 hit=75.0% PF=3.53 avg_trade=0.00220922 avg_hold=28.5 turnover_events=8
+[22:40:59] [INFO] BOOTSTRAP Sharpe | obs=2.08 95%CI=[-1.70,4.63] p(Sharpe>0)=0.893 reps=300 block=24
+[22:40:59] [INFO] PERMUTE timing | Sharpe_obs=2.03 p_perm_ge_obs=0.100 reps=300
+[22:40:59] [INFO] VALIDATION END | asset=EURUSD=X timeframe=1h | OOS Sharpe=2.08 MaxDD=0.005146
