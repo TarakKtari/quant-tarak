@@ -28,7 +28,6 @@ import warnings
 import math
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -41,13 +40,49 @@ import itertools
 # -------------------------------
 # EMD backend (REQUIRED for true HHT)
 # -------------------------------
+def _ensure_emd_logger_compat() -> None:
+    """
+    Some environments define a custom `logging.Logger.verbose` method without
+    also defining `logging.VERBOSE`. The `emd` package tries to add that level
+    and fails with: "verbose already defined in logger class".
+
+    Workaround: if the logger class already has `.verbose`, define `logging.VERBOSE`
+    so `emd.logger.set_up()` won't try to add it again.
+    """
+    try:
+        import logging as _logging
+
+        if hasattr(_logging.getLoggerClass(), "verbose") and not hasattr(_logging, "VERBOSE"):
+            level = int(_logging.INFO) - 5
+            try:
+                _logging.addLevelName(level, "VERBOSE")
+            except Exception:
+                pass
+            try:
+                setattr(_logging, "VERBOSE", level)
+            except Exception:
+                pass
+            if not hasattr(_logging, "verbose"):
+                def _root_verbose(message, *args, **kwargs):
+                    _logging.log(level, message, *args, **kwargs)
+
+                try:
+                    setattr(_logging, "verbose", _root_verbose)
+                except Exception:
+                    pass
+    except Exception:
+        # Never fail import due to a best-effort compatibility shim.
+        return
+
+
 EMD_IMPORT_ERROR = None
 try:
+    _ensure_emd_logger_compat()
     import emd  # pip package that exposes `emd.sift.sift`
     EMD_LIB = "emd"
 except Exception as e_emd:
     try:
-        from PyEMD import EMD as PyEMD_EMD  # pip package PyEMD
+        from PyEMD import EMD as PyEMD_EMD  # provided by package name `EMD-signal`
         EMD_LIB = "PyEMD"
     except Exception as e_pyemd:
         EMD_LIB = None
@@ -65,8 +100,8 @@ def require_emd_backend() -> None:
             "No EMD backend found. This pipeline runs TRUE HHT only.\n"
             "Install one of the following and retry:\n"
             "  - pip install emd\n"
-            "  - pip install PyEMD\n"
-            "Then rerun `python hht_pipeline_refactored.py --self-test`.\n"
+            "  - pip install EMD-signal   (installs module `PyEMD` for EMD decomposition)\n"
+            "Then rerun `python merged_pipeline.py --self-test`.\n"
         ) from EMD_IMPORT_ERROR
 
 
@@ -131,6 +166,27 @@ def apply_optional_feature_fallbacks(cfg: "Config") -> None:
         cfg.enable_wavelet_crosscheck = False
 
 # -------------------------------
+# Optional deps (postgres)
+# -------------------------------
+PSYCOPG2_IMPORT_ERROR = None
+try:
+    import psycopg2
+    PSYCOPG2_OK = True
+except Exception as e_psycopg2:
+    PSYCOPG2_OK = False
+    PSYCOPG2_IMPORT_ERROR = e_psycopg2
+
+
+def require_postgres_client() -> None:
+    if not PSYCOPG2_OK:
+        raise ImportError(
+            "psycopg2 is required for Postgres data loading.\n"
+            "Install and retry:\n"
+            "  - pip install psycopg2-binary\n"
+        ) from PSYCOPG2_IMPORT_ERROR
+
+
+# -------------------------------
 # Optional deps (video)
 # -------------------------------
 try:
@@ -175,6 +231,12 @@ logger = logging.getLogger(__name__)
 # -------------------------------
 @dataclass
 class Config:
+    # Data Source (Postgres)
+    # Loads OHLCV from Postgres using DATABASE_URL / --database-url
+    database_url: Optional[str] = None
+    pg_table: str = "eurusd_ohlcv_1m"
+    pg_symbol: Optional[str] = None
+
     asset: str = "EURUSD=X"
     start_date: str = "2024-06-01"
     end_date: Optional[str] = None
@@ -197,10 +259,16 @@ class Config:
     hilbert_window: int = 256  # SAFE mode: window length for cycle phase/frequency
     cycle_amp_lookback: int = 200
     cycle_amp_min_quantile: float = 0.30
+    phase_gate_mode: str = "hard"  # "hard" | "soft"
     long_phase_min: float = -np.pi / 2.0
     long_phase_max: float = 0.0
     short_phase_min: float = np.pi / 2.0
     short_phase_max: float = np.pi
+    # Soft phase gating (used when phase_gate_mode="soft")
+    # Score in [0,1]: 0.5*(1+cos(phase-center)). Trade uses a threshold.
+    soft_long_phase_center: float = -np.pi / 4.0
+    soft_short_phase_center: float = 3.0 * np.pi / 4.0
+    soft_phase_min_score: float = 0.55
 
     # Per-IMF Hilbert + confidence (HHT "make it real")
     use_per_imf_hilbert: bool = True
@@ -296,6 +364,14 @@ class Config:
     prob_min_direction_conf: float = 0.55  # in [0.5, 1.0]; uses Laplace approx on logit sign
     prob_use_phase_windows: bool = False   # if True, also enforce hard phase windows (like rules)
 
+    # Position sizing
+    position_sizing: str = "fixed"  # "fixed" | "posterior"
+    size_max_leverage: float = 1.0  # cap on |position| when sizing is enabled
+    size_min_abs: float = 0.0       # ignore tiny sizes (deadband)
+
+    # bayes-logit features
+    bayes_feature_set: str = "base"  # "base" | "regime"
+
     # Stability Filters
     noise_volatility_percentile: float = 90.0
     volatility_quantile_mode: str = "rolling_proxy"
@@ -325,209 +401,155 @@ class Config:
 # -------------------------------
 class DataLoader:
     @staticmethod
-    def _sanitize_intraday_range(
+    def _parse_date_range_utc(
         start_date: str,
         end_date: Optional[str],
-        max_days: int = 729
-    ) -> Tuple[str, Optional[str]]:
+    ) -> Tuple[pd.Timestamp, Optional[pd.Timestamp]]:
         """
-        Yahoo intraday (1h) is limited to ~730 days.
-        Make the request safe by:
-        - normalizing to tz-aware UTC for arithmetic (prevents tz-naive/tz-aware errors),
-        - forcing end_date=None if end is too old (so we fetch "up to now"),
-        - clamping start_date to max_days before the effective end,
-        - fixing reversed ranges (start >= end) by dropping end_date.
+        Normalize start/end into tz-aware UTC timestamps for Postgres queries.
+        If end_date is date-only (YYYY-MM-DD), interpret it as inclusive and convert
+        to an exclusive upper bound by adding 1 day.
         """
-        now_utc = pd.Timestamp.now(tz="UTC")
+        start_ts = pd.Timestamp(start_date, tz="UTC")
+        if end_date is None:
+            return start_ts, None
 
-        def to_utc(ts_like) -> pd.Timestamp:
-            ts = pd.Timestamp(ts_like)
-            return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+        end_raw = pd.Timestamp(end_date, tz="UTC")
+        # Treat date-only end as inclusive day; convert to exclusive upper bound.
+        if isinstance(end_date, str) and len(end_date.strip()) == 10:
+            end_raw = end_raw + pd.Timedelta(days=1)
+        return start_ts, end_raw
 
-        # If end_date is None => use now
-        end_ts = now_utc if end_date is None else to_utc(end_date)
-        start_ts = to_utc(start_date)
+    @staticmethod
+    def _database_url(cfg: Config) -> str:
+        return str(getattr(cfg, "database_url", None) or os.environ.get("DATABASE_URL") or "")
 
-        # If user provided end_date in the future, cap to now (keeps API stable)
-        if end_ts > now_utc:
-            logger.warning(f"end_date {end_date} is in the future; capping to now.")
-            end_ts = now_utc
-            end_date = None  # yfinance: end=None => up to now
+    @staticmethod
+    def _fetch_from_postgres(cfg: Config) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+        """
+        Fetch 1-minute OHLCV from Postgres and resample to cfg.timeframe.
+        Expected columns in the table:
+          - ts_event (timestamptz), open, high, low, close, volume (optional)
+        Optional filter:
+          - symbol = cfg.pg_symbol (if provided)
+        """
+        require_postgres_client()
+        dsn = DataLoader._database_url(cfg)
+        if not dsn:
+            logger.error("Postgres selected but DATABASE_URL/--database-url is not set.")
+            return None, None, None
 
-        # If end is too old for intraday, force end=None => fetch up to now
-        if (now_utc - end_ts) > pd.Timedelta(days=max_days):
-            logger.warning(
-                f"Intraday end_date {end_date} older than Yahoo intraday limit. "
-                f"Forcing end_date=None (download up to now)."
-            )
-            end_ts = now_utc
-            end_date = None
+        start_ts, end_ts = DataLoader._parse_date_range_utc(cfg.start_date, cfg.end_date)
+        table = str(getattr(cfg, "pg_table", "eurusd_ohlcv_1m"))
+        symbol = getattr(cfg, "pg_symbol", None)
 
-        # If start >= end, drop end_date (otherwise yfinance may return empty)
-        if start_ts >= end_ts:
-            logger.warning("start_date >= end_date; forcing end_date=None.")
-            return start_date, None
+        where = ["ts_event >= %(start)s"]
+        params: Dict[str, object] = {"start": start_ts.to_pydatetime()}
+        if end_ts is not None:
+            where.append("ts_event < %(end)s")
+            params["end"] = end_ts.to_pydatetime()
+        if symbol:
+            where.append("symbol = %(symbol)s")
+            params["symbol"] = str(symbol)
 
-        # Clamp start to last max_days relative to effective end_ts
-        min_start = end_ts - pd.Timedelta(days=max_days)
-        if start_ts < min_start:
-            start_date = min_start.date().isoformat()
-            logger.warning(f"Clamping start_date to {start_date} due to Yahoo intraday limit.")
+        sql = (
+            f"SELECT ts_event, open, high, low, close, volume "
+            f"FROM {table} "
+            f"WHERE {' AND '.join(where)} "
+            f"ORDER BY ts_event ASC"
+        )
 
-        return start_date, end_date
+        logger.info(f"Fetching {cfg.asset} (postgres 1m -> {cfg.timeframe}) from {cfg.start_date}...")
+        try:
+            with psycopg2.connect(dsn) as conn:
+                df = pd.read_sql_query(sql, conn, params=params)
+        except Exception as e:
+            logger.error(f"Postgres data loading failed: {e}")
+            return None, None, None
+
+        if df is None or df.empty:
+            logger.error("No data returned from Postgres.")
+            return None, None, None
+
+        # Normalize index + columns to match pipeline expectations.
+        df["ts_event"] = pd.to_datetime(df["ts_event"], utc=True)
+        df = df.set_index("ts_event").sort_index()
+        df.index = df.index.tz_convert("UTC").tz_localize(None)
+
+        # Normalize column names (Title Case) to reuse existing downstream logic.
+        rename = {"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
+        df = df.rename(columns=rename)
+        keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        df = df[keep_cols].copy()
+
+        # Deduplicate / sort
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+
+        tf = str(cfg.timeframe).lower()
+        if tf != "1m":
+            rule = DataLoader._tf_to_pandas_freq(tf) if hasattr(DataLoader, "_tf_to_pandas_freq") else tf
+            agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+            agg = {k: v for k, v in agg.items() if k in df.columns}
+
+            if not {"Open", "High", "Low", "Close"}.issubset(set(df.columns)):
+                logger.error(f"Cannot resample: OHLC missing. Columns={list(df.columns)}")
+                return None, None, None
+
+            df_r = df.resample(
+                rule,
+                label=cfg.resample_label,
+                closed=cfg.resample_closed,
+                origin="start_day",
+            ).agg(agg)
+
+            # Completeness filter (based on 1-minute samples inside each bin)
+            expected_per_bin = {
+                "1h": 60,
+                "4h": 240,
+                "12h": 720,
+                "1d": 1440,
+            }.get(tf, None)
+            if expected_per_bin is not None:
+                close_counts = df["Close"].resample(
+                    rule,
+                    label=cfg.resample_label,
+                    closed=cfg.resample_closed,
+                    origin="start_day",
+                ).count()
+                min_required = max(1, int(np.floor(0.75 * float(expected_per_bin))))
+                df_r = df_r[close_counts >= min_required]
+
+            df_r = df_r.dropna(subset=["Open", "High", "Low", "Close"])
+            df = df_r
+
+        if "Close" not in df.columns or "Open" not in df.columns:
+            logger.error(f"Missing required columns. Have: {list(df.columns)}")
+            return None, None, None
+
+        raw_close = df["Close"].dropna()
+        raw_open = df["Open"].dropna()
+        common_idx = raw_close.index.intersection(raw_open.index)
+        raw_close = raw_close.loc[common_idx].sort_index()
+        raw_open = raw_open.loc[common_idx].sort_index()
+
+        if cfg.input_transform == "log_price":
+            transformed = np.log(raw_close)
+        else:
+            transformed = raw_close.copy()
+
+        logger.info(f"Data ready: {len(raw_close)} bars.")
+        return raw_close, raw_open, transformed
 
     def _tf_to_pandas_freq(tf: str) -> str:
         # pandas >= 3.0 removed uppercase offset aliases like "H"
-        return {"1h": "1h", "4h": "4h"}.get(tf, tf)
+        return {"1h": "1h", "4h": "4h", "12h": "12h", "1d": "1D"}.get(tf, tf)
 
     @staticmethod
     def fetch_data(config: Config) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
         """
         Returns (raw_close, raw_open, transformed_close)
         """
-        # IMPORTANT: We always download 1h, even if we resample to 4h.
-        download_interval = "1h"
-
-        # Clamp to Yahoo intraday limit
-        # Sanitize intraday range to satisfy Yahoo 1h constraints
-        safe_start, safe_end = DataLoader._sanitize_intraday_range(
-            config.start_date,
-            config.end_date,
-            max_days=729
-        )
-
-        logger.info(f"Fetching {config.asset} ({download_interval} -> {config.timeframe}) from {safe_start}...")
-        try:
-            df = yf.download(
-                config.asset,
-                start=safe_start,
-                end=safe_end,
-                interval=download_interval,
-                progress=False,
-            )
-
-            if df is None or df.empty:
-                logger.error("No data returned from yfinance.")
-                return None, None, None
-
-            # ---- Column normalization (handles yfinance MultiIndex reliably) ----
-            if isinstance(df.columns, pd.MultiIndex):
-                lvl0 = df.columns.get_level_values(0)
-                lvl1 = df.columns.get_level_values(1)
-                set0, set1 = set(lvl0), set(lvl1)
-
-                # yfinance can include "Adj Close"; we ignore it later anyway
-                ohlc = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
-
-                # Case A: (field, ticker)
-                if (len(ohlc.intersection(set0)) >= 4) and (config.asset in set1):
-                    df = df.xs(config.asset, level=1, axis=1)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    else:
-                        df.columns = pd.Index(df.columns)
-
-                # Case B: (ticker, field)
-                elif (len(ohlc.intersection(set1)) >= 4) and (config.asset in set0):
-                    df = df.xs(config.asset, level=0, axis=1)
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(1)
-                    else:
-                        df.columns = pd.Index(df.columns)
-
-                else:
-                    # Fallback flatten (rare layouts)
-                    df.columns = ["_".join(map(str, c)) for c in df.columns.to_list()]
-            else:
-                df.columns = pd.Index(df.columns)
-
-            # Keep only the fields we care about (FX often has no Volume)
-            keep_cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-            df = df[keep_cols].copy()
-
-
-
-            # Ensure timezone normalization
-            if getattr(df.index, "tz", None) is not None:
-                df.index = df.index.tz_convert("UTC").tz_localize(None)
-            
-            # Deduplicate / sort (yfinance can occasionally return duplicate timestamps)
-            df = df[~df.index.duplicated(keep="last")].sort_index()
-
-
-            # ---- Resample if needed (FX-safe + completeness filter) ----
-            tf_freq = DataLoader._tf_to_pandas_freq(config.timeframe) if hasattr(DataLoader, "_tf_to_pandas_freq") else config.timeframe
-            if config.timeframe == "4h":
-                logger.info("Resampling 1h -> 4h...")
-
-                rule = "4h"
-                agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-                agg = {k: v for k, v in agg.items() if k in df.columns}
-
-                # Must have OHLC to build candles
-                if not {"Open", "High", "Low", "Close"}.issubset(set(df.columns)):
-                    logger.error(f"Cannot resample: OHLC missing. Columns={list(df.columns)}")
-                    return None, None, None
-
-                df_4h = df.resample(
-                    rule,
-                    label=config.resample_label,
-                    closed=config.resample_closed,
-                    origin="start_day",
-                ).agg(agg)
-
-                # Completeness filter: require enough 1h samples inside each 4h bin
-                expected_per_bin = 4
-                close_counts = df["Close"].resample(
-                    rule,
-                    label=config.resample_label,
-                    closed=config.resample_closed,
-                    origin="start_day",
-                ).count()
-
-                min_required = max(1, int(np.floor(0.75 * expected_per_bin)))  # 3/4 hours
-                df_4h = df_4h[close_counts >= min_required]
-
-                # Drop only if OHLC missing (do NOT drop because Volume is NaN)
-                df_4h = df_4h.dropna(subset=["Open", "High", "Low", "Close"])
-
-                df = df_4h
-
-
-
-
-            # Minimal column safety
-            if "Close" not in df.columns or "Open" not in df.columns:
-                logger.error(f"Missing required columns. Have: {list(df.columns)}")
-                return None, None, None
-
-            # Missing bars: weekday-only approximation (Mon-Fri)
-            actual_weekdays = df[df.index.weekday < 5]
-            freq = DataLoader._tf_to_pandas_freq(config.timeframe) if hasattr(DataLoader, "_tf_to_pandas_freq") else config.timeframe
-            full_range = pd.date_range(start=df.index[0], end=df.index[-1], freq=freq)
-            expected_weekdays = full_range[full_range.weekday < 5]
-            missing_count = len(expected_weekdays) - len(actual_weekdays)
-            if len(expected_weekdays) > 0 and (missing_count / len(expected_weekdays) > 0.01):
-                logger.warning(f"Missing weekday bars: {missing_count} ({(missing_count/len(expected_weekdays))*100:.1f}%)")
-
-            raw_close = df["Close"].dropna()
-            raw_open = df["Open"].dropna()
-
-            common_idx = raw_close.index.intersection(raw_open.index)
-            raw_close = raw_close.loc[common_idx].sort_index()
-            raw_open = raw_open.loc[common_idx].sort_index()
-
-            if config.input_transform == "log_price":
-                transformed = np.log(raw_close)
-            else:
-                transformed = raw_close.copy()
-
-            logger.info(f"Data ready: {len(raw_close)} bars.")
-            return raw_close, raw_open, transformed
-
-        except Exception as e:
-            logger.error(f"Data loading failed: {e}")
-            return None, None, None
+        return DataLoader._fetch_from_postgres(config)
 
 
 # -------------------------------
@@ -535,7 +557,7 @@ class DataLoader:
 # -------------------------------
 def infer_pip_size(asset: str, default: float = 0.0001) -> float:
     """
-    Best-effort pip size inference for Yahoo FX tickers.
+    Best-effort pip size inference for FX tickers/symbols.
     Examples:
       - EURUSD=X -> 0.0001
       - USDJPY=X -> 0.01
@@ -987,54 +1009,60 @@ def fetch_multi_close(
     if not assets:
         return None
 
-    # Yahoo intraday safety (always download 1h then resample if needed)
-    safe_start, safe_end = DataLoader._sanitize_intraday_range(
-        start_date=start or cfg.start_date,
-        end_date=end or cfg.end_date,
-        max_days=729,
+    require_postgres_client()
+    dsn = str(getattr(cfg, "database_url", None) or os.environ.get("DATABASE_URL") or "")
+    if not dsn:
+        logger.warning("Market context: DATABASE_URL/--database-url not set; skipping multi-asset context.")
+        return None
+
+    start_ts, end_ts = DataLoader._parse_date_range_utc(start or cfg.start_date, end or cfg.end_date)
+    table = str(getattr(cfg, "pg_table", "eurusd_ohlcv_1m"))
+    symbols = [a.strip() for a in assets if str(a).strip()]
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        return None
+
+    where = ["ts_event >= %(start)s", "symbol = ANY(%(symbols)s)"]
+    params: Dict[str, object] = {"start": start_ts.to_pydatetime(), "symbols": symbols}
+    if end_ts is not None:
+        where.append("ts_event < %(end)s")
+        params["end"] = end_ts.to_pydatetime()
+
+    sql = (
+        f"SELECT ts_event, symbol, close "
+        f"FROM {table} "
+        f"WHERE {' AND '.join(where)} "
+        f"ORDER BY ts_event ASC"
     )
 
-    df = yf.download(
-        tickers=assets,
-        start=safe_start,
-        end=safe_end,
-        interval="1h",
-        progress=False,
-        threads=True,
-    )
+    try:
+        with psycopg2.connect(dsn) as conn:
+            df = pd.read_sql_query(sql, conn, params=params)
+    except Exception as e:
+        logger.warning(f"Market context: Postgres multi-close fetch failed ({e}); continuing without context gate.")
+        return None
+
     if df is None or df.empty:
         return None
 
-    if isinstance(df.columns, pd.MultiIndex):
-        # common layout: (field, ticker)
-        if "Close" in set(df.columns.get_level_values(0)):
-            close = df["Close"].copy()
-        elif "Close" in set(df.columns.get_level_values(1)):
-            close = df.xs("Close", level=1, axis=1).copy()
-        else:
-            return None
-    else:
-        # single column fallback
-        if "Close" in df.columns:
-            close = df[["Close"]].copy()
-            close.columns = [assets[0]]
-        else:
-            return None
-
-    if getattr(close.index, "tz", None) is not None:
-        close.index = close.index.tz_convert("UTC").tz_localize(None)
+    df["ts_event"] = pd.to_datetime(df["ts_event"], utc=True)
+    df = df.sort_values(["ts_event", "symbol"])
+    close = df.pivot(index="ts_event", columns="symbol", values="close").sort_index()
+    close.index = close.index.tz_convert("UTC").tz_localize(None)
     close = close[~close.index.duplicated(keep="last")].sort_index()
 
-    if cfg.timeframe == "4h":
+    timeframe = str(getattr(cfg, "timeframe", "1h")).lower()
+    if timeframe in ("4h", "12h", "1h", "1d"):
+        rule = DataLoader._tf_to_pandas_freq(timeframe) if hasattr(DataLoader, "_tf_to_pandas_freq") else timeframe
+        # For market context we only need closes; last is fine.
         close = close.resample(
-            "4h",
+            rule,
             label=cfg.resample_label,
             closed=cfg.resample_closed,
             origin="start_day",
         ).last()
 
-    # keep columns in same order as requested
-    cols = [a for a in assets if a in close.columns]
+    cols = [a for a in symbols if a in close.columns]
     close = close[cols].dropna(how="all")
     return close
 
@@ -1778,6 +1806,21 @@ def _fit_bayes_logit_map(
 
 class TradingSignalEngine:
     @staticmethod
+    def _phase_scores(
+        phase: np.ndarray,
+        config: Config,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns (long_score, short_score) in [0,1] based on circular proximity to centers.
+        """
+        ph = np.asarray(phase, dtype=float)
+        long_c = float(getattr(config, "soft_long_phase_center", -np.pi / 4.0))
+        short_c = float(getattr(config, "soft_short_phase_center", 3.0 * np.pi / 4.0))
+        long_score = 0.5 * (1.0 + np.cos(ph - long_c))
+        short_score = 0.5 * (1.0 + np.cos(ph - short_c))
+        return long_score.astype(float), short_score.astype(float)
+
+    @staticmethod
     def generate_signals(
         raw_close: np.ndarray,
         raw_open: np.ndarray,
@@ -1913,6 +1956,8 @@ class TradingSignalEngine:
         phase_long_ok = np.ones(n, dtype=bool)
         phase_short_ok = np.ones(n, dtype=bool)
         phase_amp_ok = np.ones(n, dtype=bool)
+        phase_long_score = np.ones(n, dtype=float)
+        phase_short_score = np.ones(n, dtype=float)
         if config.use_cycle_phase:
             if cycle_phase is None or cycle_amp is None:
                 raise ValueError("use_cycle_phase=True but cycle_phase/cycle_amp not found in components.")
@@ -1923,11 +1968,22 @@ class TradingSignalEngine:
             phase_long_ok = (phase >= config.long_phase_min) & (phase <= config.long_phase_max)
             phase_short_ok = (phase >= config.short_phase_min) & (phase <= config.short_phase_max)
 
+            phase_long_score, phase_short_score = TradingSignalEngine._phase_scores(phase, config)
+
             amp_s = pd.Series(amp, index=index_timestamps)
             amp_thr = amp_s.rolling(int(amp_lb), min_periods=max(50, int(amp_lb) // 4)).quantile(
                 config.cycle_amp_min_quantile
             )
-        phase_amp_ok = (amp_s >= amp_thr).fillna(False).values
+            phase_amp_ok = (amp_s >= amp_thr).fillna(False).values
+        else:
+            amp_s = pd.Series(np.full(n, np.nan), index=index_timestamps)
+            amp_thr = pd.Series(np.full(n, np.nan), index=index_timestamps)
+            phase_amp_ok = np.ones(n, dtype=bool)
+
+        phase_mode = str(getattr(config, "phase_gate_mode", "hard")).lower()
+        soft_min = float(getattr(config, "soft_phase_min_score", 0.55))
+        phase_long_soft_ok = (phase_long_score >= soft_min)
+        phase_short_soft_ok = (phase_short_score >= soft_min)
 
 
         # execution price series
@@ -1953,6 +2009,10 @@ class TradingSignalEngine:
             phase = np.asarray(cycle_phase, dtype=float) if cycle_phase is not None else np.full(n, np.nan, dtype=float)
             amp = np.asarray(cycle_amp, dtype=float) if cycle_amp is not None else np.full(n, np.nan, dtype=float)
             conf = np.asarray(cycle_confidence, dtype=float) if cycle_confidence is not None else np.full(n, np.nan, dtype=float)
+            conc = np.asarray(components.get("cycle_imf_concentration", np.full(n, np.nan)), dtype=float)
+            ou_hl = np.asarray(components.get("ou_half_life", np.full(n, np.nan)), dtype=float)
+            m_stress = np.asarray(components.get("market_stress_score", np.full(n, np.nan)), dtype=float)
+            chaos_d = np.asarray(components.get("chaos_distance", np.full(n, np.nan)), dtype=float)
 
             z_feat = np.clip(np.asarray(z_arr, dtype=float), -8.0, 8.0)
             slope_feat = np.asarray(slope, dtype=float)
@@ -1961,7 +2021,18 @@ class TradingSignalEngine:
             amp_feat = np.log1p(np.abs(amp))
             conf_feat = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
 
-            X_full = np.column_stack([z_feat, slope_feat, sin_p, cos_p, amp_feat, conf_feat]).astype(float)
+            feats = [z_feat, slope_feat, sin_p, cos_p, amp_feat, conf_feat]
+
+            feat_set = str(getattr(config, "bayes_feature_set", "base")).lower()
+            if feat_set == "regime":
+                # Regime/context extras: stable transforms, fill missing with 0.
+                conc_feat = np.nan_to_num(conc, nan=0.0, posinf=0.0, neginf=0.0)
+                hl_feat = np.nan_to_num(np.log1p(np.maximum(ou_hl, 0.0)), nan=0.0, posinf=0.0, neginf=0.0)
+                stress_feat = np.nan_to_num(m_stress, nan=0.0, posinf=0.0, neginf=0.0)
+                chaos_feat = np.nan_to_num(chaos_d, nan=0.0, posinf=0.0, neginf=0.0)
+                feats.extend([conc_feat, hl_feat, stress_feat, chaos_feat])
+
+            X_full = np.column_stack(feats).astype(float)
             y_full = (next_ret > 0.0).astype(float)
 
             fit_start = int(config.bayes_fit_start) if config.bayes_fit_start is not None else int(start_idx)
@@ -2016,6 +2087,9 @@ class TradingSignalEngine:
                 enter_edge = float(max(0.0, min(0.49, config.prob_enter_edge)))
                 exit_edge = float(max(0.0, min(0.49, config.prob_exit_edge)))
                 min_conf = float(max(0.5, min(1.0, config.prob_min_direction_conf)))
+                sizing = str(getattr(config, "position_sizing", "fixed")).lower()
+                size_cap = float(max(0.0, getattr(config, "size_max_leverage", 1.0)))
+                size_deadband = float(max(0.0, getattr(config, "size_min_abs", 0.0)))
 
                 for t in range(start_idx, n - 1):
                     target = curr_pos
@@ -2036,26 +2110,44 @@ class TradingSignalEngine:
                             long_ok = True
                             short_ok = True
                             if bool(config.prob_use_phase_windows):
-                                long_ok = bool(phase_long_ok[t])
-                                short_ok = bool(phase_short_ok[t])
+                                if phase_mode == "soft":
+                                    long_ok = bool(phase_long_soft_ok[t])
+                                    short_ok = bool(phase_short_soft_ok[t])
+                                else:
+                                    long_ok = bool(phase_long_ok[t])
+                                    short_ok = bool(phase_short_ok[t])
 
                             amp_ok = bool(phase_amp_ok[t])
 
                             if curr_pos == 0:
                                 if (c_t >= min_conf) and amp_ok and long_ok and (p_t >= 0.5 + enter_edge):
-                                    target = 1
+                                    if sizing == "posterior":
+                                        sz = (p_t - 0.5) / max(1e-9, enter_edge)
+                                        sz = float(max(-size_cap, min(size_cap, sz)))
+                                        if abs(sz) < size_deadband:
+                                            sz = 0.0
+                                        target = float(max(0.0, sz))
+                                    else:
+                                        target = 1
                                     entry_sig[t] = 1
                                 elif (c_t >= min_conf) and amp_ok and short_ok and (p_t <= 0.5 - enter_edge):
-                                    target = -1
+                                    if sizing == "posterior":
+                                        sz = (p_t - 0.5) / max(1e-9, enter_edge)
+                                        sz = float(max(-size_cap, min(size_cap, sz)))
+                                        if abs(sz) < size_deadband:
+                                            sz = 0.0
+                                        target = float(min(0.0, sz))
+                                    else:
+                                        target = -1
                                     entry_sig[t] = -1
-                            elif curr_pos == 1:
+                            elif curr_pos > 0:
                                 if p_t <= 0.5 + exit_edge:
                                     target = 0
                                     exit_sig[t] = 1
                                 elif np.isfinite(z_arr[t]) and (z_arr[t] < -config.stop_loss_zscore):
                                     target = 0
                                     exit_sig[t] = -1
-                            elif curr_pos == -1:
+                            elif curr_pos < 0:
                                 if p_t >= 0.5 - exit_edge:
                                     target = 0
                                     exit_sig[t] = 1
@@ -2083,9 +2175,11 @@ class TradingSignalEngine:
                         exit_sig[t] = 1
                     else:
                         if curr_pos == 0 and is_en:
-                            if slope[t] > 0 and z_arr[t] < -config.entry_zscore and phase_long_ok[t] and phase_amp_ok[t]:
+                            long_ok = phase_long_soft_ok[t] if phase_mode == "soft" else phase_long_ok[t]
+                            short_ok = phase_short_soft_ok[t] if phase_mode == "soft" else phase_short_ok[t]
+                            if slope[t] > 0 and z_arr[t] < -config.entry_zscore and long_ok and phase_amp_ok[t]:
                                 target = 1; entry_sig[t] = 1
-                            elif slope[t] < 0 and z_arr[t] > config.entry_zscore and phase_short_ok[t] and phase_amp_ok[t]:
+                            elif slope[t] < 0 and z_arr[t] > config.entry_zscore and short_ok and phase_amp_ok[t]:
                                 target = -1; entry_sig[t] = -1
                         elif curr_pos == 1:
                             if z_arr[t] >= config.exit_zscore:
@@ -2172,6 +2266,8 @@ def _bars_per_year(timeframe: str) -> int:
         return 24 * 252
     if timeframe == "4h":
         return 6 * 252
+    if timeframe == "12h":
+        return 2 * 252
     return 252
 
 
@@ -2324,6 +2420,49 @@ def _grid_candidates_bayes_logit() -> List[Dict[str, float]]:
     return out
 
 
+def _random_candidates_rules(rng: np.random.Generator, n: int) -> List[Dict[str, float]]:
+    n = int(max(0, n))
+    out: List[Dict[str, float]] = []
+    for _ in range(n):
+        entry_z = float(rng.uniform(1.0, 3.0))
+        stop_z = float(rng.uniform(2.0, 6.0))
+        amp_q = float(rng.uniform(0.05, 0.50))
+        out.append(
+            {
+                "entry_zscore": float(np.round(entry_z * 4.0) / 4.0),  # 0.25 grid
+                "exit_zscore": 0.0,
+                "stop_loss_zscore": float(np.round(stop_z * 2.0) / 2.0),  # 0.5 grid
+                "cycle_amp_min_quantile": float(np.round(amp_q * 100.0) / 100.0),  # 0.01 grid
+            }
+        )
+    return out
+
+
+def _random_candidates_bayes_logit(rng: np.random.Generator, n: int) -> List[Dict[str, float]]:
+    n = int(max(0, n))
+    out: List[Dict[str, float]] = []
+    for _ in range(n):
+        # Log-uniform for regularization strength.
+        u = float(rng.uniform(np.log(0.25), np.log(20.0)))
+        bayes_l2 = float(np.exp(u))
+
+        enter_edge = float(rng.uniform(0.02, 0.25))
+        # Keep hysteresis strictly inside enter band.
+        exit_edge = float(rng.uniform(0.005, max(0.006, min(0.10, 0.8 * enter_edge))))
+        min_conf = float(rng.uniform(0.50, 0.70))
+
+        out.append(
+            {
+                "signal_model": "bayes-logit",
+                "bayes_l2": float(np.round(bayes_l2, 6)),
+                "prob_enter_edge": float(np.round(enter_edge, 3)),
+                "prob_exit_edge": float(np.round(exit_edge, 3)),
+                "prob_min_direction_conf": float(np.round(min_conf, 3)),
+            }
+        )
+    return out
+
+
 def _copy_cfg(cfg: Config, overrides: Dict[str, float]) -> Config:
     d = cfg.__dict__.copy()
     d.update(overrides)
@@ -2342,6 +2481,11 @@ def run_walk_forward_validation(
     step_bars: int,
     min_trades_train: int,
     seed: int,
+    tune_trials: int = 0,
+    tune_val_frac: float = 0.20,
+    tune_seed: Optional[int] = None,
+    tune_include_grid: bool = True,
+    embargo_bars: int = 0,
 ) -> Dict[str, Union[pd.DataFrame, Dict[str, float]]]:
     """
     Walk-forward:
@@ -2376,8 +2520,15 @@ def run_walk_forward_validation(
     )
 
     is_bayes = str(getattr(base_cfg, "signal_model", "rules")).lower() == "bayes-logit"
-    candidates = _grid_candidates_bayes_logit() if is_bayes else _grid_candidates()
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(int(seed if tune_seed is None else tune_seed))
+
+    base_candidates = _grid_candidates_bayes_logit() if is_bayes else _grid_candidates()
+    random_n = int(max(0, tune_trials))
+    rand_candidates = _random_candidates_bayes_logit(rng, random_n) if is_bayes else _random_candidates_rules(rng, random_n)
+    if bool(tune_include_grid):
+        candidates = base_candidates + rand_candidates
+    else:
+        candidates = rand_candidates if rand_candidates else base_candidates
 
     # OOS stitched container + coverage mask
     oos = pd.DataFrame(index=raw_close.index)
@@ -2408,8 +2559,11 @@ def run_walk_forward_validation(
     for anchor in range(start_anchor, n - test_bars - 1, step_bars):
         train_end = anchor
         train_start = train_end - train_bars
-        test_start = train_end
+        embargo = int(max(0, embargo_bars))
+        test_start = train_end + embargo
         test_end = min(n, test_start + test_bars)
+        if test_start >= n - 1:
+            break
 
         slice_start = max(0, train_start - history)
         slice_end = test_end
@@ -2433,9 +2587,26 @@ def run_walk_forward_validation(
         te_s = test_start - slice_start
         te_e = test_end - slice_start
 
+        # Nested tuning: split TRAIN into fit/val, score on VAL (prevents obvious overfit).
+        # If the window is too short, fall back to TRAIN scoring.
+        score_on_val = False
+        val_start = None
+        fit_end = None
+        val_frac = float(max(0.05, min(0.50, float(tune_val_frac))))
+        train_len = int(tr_e - tr_s)
+        if int(random_n) > 0 and train_len >= 250:
+            val_len = int(max(50, round(train_len * val_frac)))
+            val_len = int(min(val_len, max(50, train_len - 50)))
+            vs = int(tr_e - val_len)
+            if vs > (tr_s + 50):
+                score_on_val = True
+                val_start = vs
+                fit_end = vs
+
         best = None
         best_score = -1e9
         best_train_metrics = None
+        best_val_metrics = None
         best_cfg = None
 
         for cand in candidates:
@@ -2443,17 +2614,31 @@ def run_walk_forward_validation(
             if is_bayes:
                 # Fit the probabilistic model on TRAIN only (avoid leakage into the test window).
                 cfg.bayes_fit_start = int(tr_s)
-                cfg.bayes_fit_end = int(max(tr_s + 1, tr_e - 1))
+                if score_on_val and fit_end is not None:
+                    cfg.bayes_fit_end = int(max(tr_s + 1, int(fit_end) - 1))
+                else:
+                    cfg.bayes_fit_end = int(max(tr_s + 1, tr_e - 1))
             sig = TradingSignalEngine.generate_signals(rc, ro, tr, comps, cfg, idx)
             sig_train = _slice_signals(sig, tr_s, tr_e)
             m_train = compute_performance_metrics(sig_train, timeframe)
             if int(m_train["trades"]) < int(min_trades_train):
                 continue
-            score = float(m_train["sharpe"])
+
+            if score_on_val and val_start is not None:
+                sig_val = _slice_signals(sig, int(val_start), tr_e)
+                m_val = compute_performance_metrics(sig_val, timeframe)
+                if int(m_val["trades"]) < 1:
+                    continue
+                score = float(m_val["sharpe"])
+            else:
+                m_val = None
+                score = float(m_train["sharpe"])
+
             if score > best_score:
                 best_score = score
                 best = sig
                 best_train_metrics = m_train
+                best_val_metrics = m_val
                 best_cfg = cfg
 
         if best is None:
@@ -2465,7 +2650,15 @@ def run_walk_forward_validation(
                 best_cfg.bayes_fit_end = int(max(tr_s + 1, tr_e - 1))
             best = TradingSignalEngine.generate_signals(rc, ro, tr, comps, best_cfg, idx)
             best_train_metrics = compute_performance_metrics(_slice_signals(best, tr_s, tr_e), timeframe)
+            best_val_metrics = None
             logger.warning(f"WF fold {fold}: no candidate met min_trades; using fallback {cand}.")
+
+        # If bayes-logit and we scored on a nested VAL, refit on full TRAIN before testing.
+        if is_bayes and best_cfg is not None:
+            best_cfg.bayes_fit_start = int(tr_s)
+            best_cfg.bayes_fit_end = int(max(tr_s + 1, tr_e - 1))
+            best = TradingSignalEngine.generate_signals(rc, ro, tr, comps, best_cfg, idx)
+            best_train_metrics = compute_performance_metrics(_slice_signals(best, tr_s, tr_e), timeframe)
 
         sig_test = _slice_signals(best, te_s, te_e)
         m_test = compute_performance_metrics(sig_test, timeframe)
@@ -2482,6 +2675,8 @@ def run_walk_forward_validation(
                 f"WF fold {fold} | train[{train_range}] test[{test_range}] | "
                 f"best={{entry={best_cfg.entry_zscore}, exit={best_cfg.exit_zscore}, stop={best_cfg.stop_loss_zscore}, amp_q={best_cfg.cycle_amp_min_quantile}}}"
             )
+        if score_on_val and best_val_metrics is not None:
+            _log_metrics(f"WF fold {fold} VAL  ", best_val_metrics)
         _log_metrics(f"WF fold {fold} TRAIN", best_train_metrics)
         _log_metrics(f"WF fold {fold} TEST ", m_test)
 
@@ -2638,6 +2833,11 @@ def run_validation_suite(
     bootstrap_block: int,
     perm_reps: int,
     seed: int,
+    tune_trials: int = 0,
+    tune_val_frac: float = 0.20,
+    tune_seed: Optional[int] = None,
+    tune_include_grid: bool = True,
+    embargo_bars: int = 0,
 ) -> int:
     """
     Runs:
@@ -2721,6 +2921,11 @@ def run_validation_suite(
                     step_bars=int(step_bars),
                     min_trades_train=int(min_trades_train),
                     seed=int(seed),
+                    tune_trials=int(tune_trials),
+                    tune_val_frac=float(tune_val_frac),
+                    tune_seed=(None if tune_seed is None else int(tune_seed)),
+                    tune_include_grid=bool(tune_include_grid),
+                    embargo_bars=int(embargo_bars),
                 )
             except Exception as e:
                 logger.error(f"Walk-forward failed: {e}")
@@ -2958,8 +3163,15 @@ def run_self_test(cfg: Config) -> int:
 # -------------------------------
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--database-url", default=None, help="Optional override for DATABASE_URL (Postgres connection string).")
+    parser.add_argument("--pg-table", default="eurusd_ohlcv_1m", help="Postgres table containing 1-minute OHLCV.")
+    parser.add_argument("--pg-symbol", default=None, help="Optional symbol filter for Postgres table (e.g., '6E.v.0').")
     parser.add_argument("--asset", default="EURUSD=X")
-    parser.add_argument("--timeframe", default="1h", choices=["1h", "4h"])
+    parser.add_argument("--timeframe", default="1h", choices=["1h", "4h", "12h", "1d"])
+    parser.add_argument("--execution-price-type", default=None, choices=["next_open", "next_close"], help="Execution price series for PnL.")
+    parser.add_argument("--spread-pips", type=float, default=None, help="Half-spread model input in pips (round-turn cost modeled via half-spread).")
+    parser.add_argument("--pip-size", type=float, default=None, help="Pip size (e.g., 0.0001 for EURUSD). Overrides auto inference.")
+    parser.add_argument("--no-costs", action="store_true", help="Set spread to 0 (research only).")
     parser.add_argument("--duration", type=int, default=20)
     parser.add_argument("--safe-mode", action="store_true")
     parser.add_argument("--start", default=None, help="YYYY-MM-DD (optional)")
@@ -2984,6 +3196,7 @@ def main():
     parser.add_argument("--train-bars", type=int, default=2000, help="Walk-forward train window (bars)")
     parser.add_argument("--test-bars", type=int, default=500, help="Walk-forward test window (bars)")
     parser.add_argument("--step-bars", type=int, default=500, help="Walk-forward step size (bars)")
+    parser.add_argument("--embargo-bars", type=int, default=0, help="Gap between train and test windows (bars).")
     parser.add_argument("--decompose-every", type=int, default=20, help="SAFE decomposition frequency (bars). Higher=faster.")
     parser.add_argument("--rolling-window", type=int, default=600, help="SAFE decomposition rolling window length (bars)")
     parser.add_argument("--min-trades-train", type=int, default=5, help="Minimum trades required in train window")
@@ -2991,12 +3204,22 @@ def main():
     parser.add_argument("--bootstrap-block", type=int, default=24, help="Bootstrap block length (bars)")
     parser.add_argument("--perm-reps", type=int, default=300, help="Permutation repetitions")
     parser.add_argument("--seed", type=int, default=123, help="Random seed")
+    parser.add_argument("--tune-trials", type=int, default=0, help="Random-search trials per fold (0 disables tuning; uses fixed grid).")
+    parser.add_argument("--tune-val-frac", type=float, default=0.20, help="When tuning, score on last frac of train window (0.05..0.50).")
+    parser.add_argument("--tune-seed", type=int, default=None, help="Optional seed for the tuner (defaults to --seed).")
+    parser.add_argument("--tune-no-grid", action="store_true", help="When tuning, do NOT include the default grid (random trials only).")
     parser.add_argument(
         "--signal-model",
         default="rules",
         choices=["rules", "bayes-logit"],
         help="Signal model: legacy rules or bayes-logit (MAP logistic + probability hysteresis).",
     )
+    parser.add_argument("--phase-gate-mode", default=None, choices=["hard", "soft"], help="Phase gate mode for rules/phase windows.")
+    parser.add_argument("--soft-phase-min-score", type=float, default=None, help="Soft phase minimum score (0..1).")
+    parser.add_argument("--bayes-feature-set", default=None, choices=["base", "regime"], help="bayes-logit feature set.")
+    parser.add_argument("--position-sizing", default=None, choices=["fixed", "posterior"], help="Position sizing mode.")
+    parser.add_argument("--size-max-leverage", type=float, default=None, help="Max |position| when sizing enabled.")
+    parser.add_argument("--size-min-abs", type=float, default=None, help="Deadband for small |position| sizes.")
     parser.add_argument("--bayes-l2", type=float, default=None, help="bayes-logit: L2 prior precision (smaller=more flexible).")
     parser.add_argument("--bayes-min-train-samples", type=int, default=None, help="bayes-logit: minimum samples required to fit.")
     parser.add_argument("--bayes-fit-only-enabled", action="store_true", help="bayes-logit: fit only on bars where trade_enabled=True.")
@@ -3013,10 +3236,25 @@ def main():
         backtest_safe=args.safe_mode,
         duration_sec=args.duration,
     )
+    if args.database_url:
+        cfg.database_url = str(args.database_url)
+    if args.pg_table:
+        cfg.pg_table = str(args.pg_table)
+    if args.pg_symbol:
+        cfg.pg_symbol = str(args.pg_symbol)
     if args.start:
         cfg.start_date = args.start
     if args.end:
         cfg.end_date = args.end
+    if args.execution_price_type is not None:
+        cfg.execution_price_type = str(args.execution_price_type)
+    if args.no_costs:
+        cfg.spread_pips = 0.0
+    if args.spread_pips is not None:
+        cfg.spread_pips = float(args.spread_pips)
+    if args.pip_size is not None:
+        cfg.pip_size = float(args.pip_size)
+        cfg.auto_pip_size = False
     if args.no_wavelet:
         cfg.enable_wavelet_crosscheck = False
     if args.no_fft:
@@ -3043,6 +3281,18 @@ def main():
         cfg.auto_pip_size = False
     if args.signal_model:
         cfg.signal_model = str(args.signal_model)
+    if args.phase_gate_mode is not None:
+        cfg.phase_gate_mode = str(args.phase_gate_mode)
+    if args.soft_phase_min_score is not None:
+        cfg.soft_phase_min_score = float(args.soft_phase_min_score)
+    if args.bayes_feature_set is not None:
+        cfg.bayes_feature_set = str(args.bayes_feature_set)
+    if args.position_sizing is not None:
+        cfg.position_sizing = str(args.position_sizing)
+    if args.size_max_leverage is not None:
+        cfg.size_max_leverage = float(args.size_max_leverage)
+    if args.size_min_abs is not None:
+        cfg.size_min_abs = float(args.size_min_abs)
     if args.bayes_l2 is not None:
         cfg.bayes_l2 = float(args.bayes_l2)
     if args.bayes_min_train_samples is not None:
@@ -3075,6 +3325,7 @@ def main():
             train_bars=args.train_bars,
             test_bars=args.test_bars,
             step_bars=args.step_bars,
+            embargo_bars=int(args.embargo_bars),
             decompose_every=args.decompose_every,
             rolling_window=args.rolling_window,
             min_trades_train=args.min_trades_train,
@@ -3082,6 +3333,10 @@ def main():
             bootstrap_block=args.bootstrap_block,
             perm_reps=args.perm_reps,
             seed=args.seed,
+            tune_trials=int(args.tune_trials),
+            tune_val_frac=float(args.tune_val_frac),
+            tune_seed=(None if args.tune_seed is None else int(args.tune_seed)),
+            tune_include_grid=(not bool(args.tune_no_grid)),
         )
         sys.exit(int(rc))
 
@@ -3113,8 +3368,9 @@ def main():
     if cfg.enable_market_context and args.context_assets:
         ctx_assets = [a.strip() for a in str(args.context_assets).split(",") if a.strip()]
         if ctx_assets:
-            if cfg.asset not in ctx_assets:
-                ctx_assets = [cfg.asset] + ctx_assets
+            base_symbol = str(cfg.pg_symbol) if cfg.pg_symbol else str(cfg.asset)
+            if base_symbol not in ctx_assets:
+                ctx_assets = [base_symbol] + ctx_assets
             # de-dup while preserving order
             ctx_assets = list(dict.fromkeys(ctx_assets))
 
